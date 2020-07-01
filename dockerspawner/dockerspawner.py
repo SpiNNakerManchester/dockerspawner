@@ -19,6 +19,7 @@ from tornado import gen, web
 
 from escapism import escape
 from jupyterhub.spawner import Spawner
+from jupyterhub.app import JupyterHub
 from traitlets import (
     Any,
     Bool,
@@ -615,6 +616,17 @@ class DockerSpawner(Spawner):
         ),
     )
 
+    proxy_ports = Dict(
+        {},
+        config=True,
+        help=dedent(
+            """
+            A dict of service name to port to expose via the proxy. 
+            These ports will be available via /user/{username}/{service_name}/
+            """
+        ),
+    )
+
     post_start_cmd = UnicodeOrFalse(
         False,
         config=True,
@@ -888,6 +900,10 @@ class DockerSpawner(Spawner):
         # ensure internal port is exposed
         create_kwargs["ports"] = {"%i/tcp" % self.port: None}
 
+        # add extra proxy ports
+        create_kwargs["ports"],update({
+            "{}".format(port): None for port in proxy_ports.values()})
+
         create_kwargs.update(self.extra_create_kwargs)
 
         # build the dictionary of keyword arguments for host_config
@@ -1062,6 +1078,17 @@ class DockerSpawner(Spawner):
             # store on user for pre-jupyterhub-0.7:
             self.user.server.ip = ip
             self.user.server.port = port
+
+        # map additional ports to the proxy
+        proxy = JupyterHub.instance().proxy
+        for service_name, i_port in self.proxy_ports.items():
+            ip, e_port = yield self.get_ip_and_port(i_port)
+            proxy.add_route(
+                "/user/{}/{}/".format(self.user.name, service_name),
+                "http://{}:{}/".format(ip, e_port),
+                {"dockerspawner_proxy_for": self.user.name,
+                 "dockerspawner_container": self.container_id})
+
         # jupyterhub 0.7 prefers returning ip, port:
         return (ip, port)
 
@@ -1074,20 +1101,26 @@ class DockerSpawner(Spawner):
         return self.container_name
 
     @gen.coroutine
-    def get_ip_and_port(self):
-        """Queries Docker daemon for container's IP and port.
+    def get_ip_and_port(self, internal_port=None):
+        """Queries Docker daemon for container's IP and a given internal port,
+        or the container port if internal_port is None.
 
         If you are using network_mode=host, you will need to override
         this method as follows::
 
             @gen.coroutine
-            def get_ip_and_port(self):
-                return self.host_ip, self.port
+            def get_ip_and_port(self, internal_port=None):
+                if internal_port is None:
+                    internal_port = self.port
+                return self.host_ip, internal_port
 
         You will need to make sure host_ip and port
         are correct, which depends on the route to the container
         and the port it opens.
         """
+        if internal_port is None:
+            internal_port = self.port
+
         if self.use_internal_hostname:
             # internal ssl uses hostnames,
             # required for domain-name matching with internal SSL
@@ -1095,7 +1128,7 @@ class DockerSpawner(Spawner):
             # are there any cases where internal_ip works
             # and internal_hostname doesn't?
             ip = self.internal_hostname
-            port = self.port
+            port = internal_port
         elif self.use_internal_ip:
             resp = yield self.docker("inspect_container", self.container_id)
             network_settings = resp["NetworkSettings"]
@@ -1103,9 +1136,9 @@ class DockerSpawner(Spawner):
                 ip = self.get_network_ip(network_settings)
             else:  # Fallback for old versions of docker (<1.9) without network management
                 ip = network_settings["IPAddress"]
-            port = self.port
+            port = internal_port
         else:
-            resp = yield self.docker("port", self.container_id, self.port)
+            resp = yield self.docker("port", self.container_id, internal_port)
             if resp is None:
                 raise RuntimeError("Failed to get port info for %s" % self.container_id)
 
@@ -1151,6 +1184,13 @@ class DockerSpawner(Spawner):
 
         if self.remove:
             yield self.remove_object()
+
+        # remove proxy ports
+        proxy = JupyterHub.instance().proxy
+        for service_name, i_port in self.proxy_ports.items():
+            ip, e_port = yield self.get_ip_and_port(i_port)
+            proxy.delete_route(
+                "/user/{}/{}/".format(self.user.name, service_name))
 
         self.clear_state()
 
