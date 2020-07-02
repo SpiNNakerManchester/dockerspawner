@@ -901,8 +901,8 @@ class DockerSpawner(Spawner):
         create_kwargs["ports"] = {"%i/tcp" % self.port: None}
 
         # add extra proxy ports
-        create_kwargs["ports"],update({
-            "{}".format(port): None for port in proxy_ports.values()})
+        create_kwargs["ports"].update({
+            "%i/tcp" % port: None for port in self.proxy_ports.values()})
 
         create_kwargs.update(self.extra_create_kwargs)
 
@@ -917,6 +917,9 @@ class DockerSpawner(Spawner):
 
         if not self.use_internal_ip:
             host_config["port_bindings"] = {self.port: (self.host_ip,)}
+            host_config["port_bindings"].update({
+                port: (self.host_ip,) for port in self.proxy_ports.values()
+            })
         host_config.update(self.extra_host_config)
         host_config.setdefault("network_mode", self.network_name)
 
@@ -983,6 +986,9 @@ class DockerSpawner(Spawner):
                 # not present, pull it for the first time
                 self.log.info("pulling image %s", image)
                 yield self.docker('pull', repo, tag)
+
+    def _proxy_path(self, service_name):
+        return "/proxy/{}/{}/".format(self.user.name, service_name)
 
     @gen.coroutine
     def start(self, image=None, extra_create_kwargs=None, extra_host_config=None):
@@ -1083,9 +1089,11 @@ class DockerSpawner(Spawner):
         proxy = JupyterHub.instance().proxy
         for service_name, i_port in self.proxy_ports.items():
             ip, e_port = yield self.get_ip_and_port(i_port)
-            proxy.add_route(
-                "/user/{}/{}/".format(self.user.name, service_name),
-                "http://{}:{}/".format(ip, e_port),
+            path = self._proxy_path(service_name)
+            target = "http://{}:{}/".format(ip, e_port)
+            self.log.info("Adding proxy from {} to {}".format(path, target))
+            yield proxy.add_route(
+                path, target,
                 {"dockerspawner_proxy_for": self.user.name,
                  "dockerspawner_container": self.container_id})
 
@@ -1140,7 +1148,7 @@ class DockerSpawner(Spawner):
         else:
             resp = yield self.docker("port", self.container_id, internal_port)
             if resp is None:
-                raise RuntimeError("Failed to get port info for %s" % self.container_id)
+                raise RuntimeError("Failed to get port info on port %d for %s" % (internal_port, self.container_id))
 
             ip = resp[0]["HostIp"]
             port = int(resp[0]["HostPort"])
@@ -1188,9 +1196,7 @@ class DockerSpawner(Spawner):
         # remove proxy ports
         proxy = JupyterHub.instance().proxy
         for service_name, i_port in self.proxy_ports.items():
-            ip, e_port = yield self.get_ip_and_port(i_port)
-            proxy.delete_route(
-                "/user/{}/{}/".format(self.user.name, service_name))
+            yield proxy.delete_route(self._proxy_path(service_name))
 
         self.clear_state()
 
