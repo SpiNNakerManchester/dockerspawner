@@ -20,6 +20,9 @@ from tornado import gen, web
 from escapism import escape
 from jupyterhub.spawner import Spawner
 from jupyterhub.app import JupyterHub
+from jupyterhub import orm
+from jupyterhub.objects import Server
+from jupyterhub.services.service import Service
 from traitlets import (
     Any,
     Bool,
@@ -990,6 +993,19 @@ class DockerSpawner(Spawner):
     def _proxy_path(self, service_name):
         return "/proxy/{}/{}/".format(self.user.name, service_name)
 
+    def _create_service(self, host, port, path, service_name):
+        app = JupyterHub.instance()
+        db = app.db
+        name = service_name + ":" + self.user.name
+        orm_server = orm.Server(proto="http", ip=host, port=port, base_url=path, cookie_name="")
+        server = Server.from_orm(orm_server)
+        orm_service = orm.Service(name=name, server=orm_server)
+        db.add(orm_service)
+        db.commit()
+        service = Service(app=app, db=db, orm=orm_service, domain='', host=host, hub=app.hub)
+        app._service_map[name] = service
+        return service
+
     @gen.coroutine
     def start(self, image=None, extra_create_kwargs=None, extra_host_config=None):
         """Start the single-user server in a docker container.
@@ -1086,16 +1102,14 @@ class DockerSpawner(Spawner):
             self.user.server.port = port
 
         # map additional ports to the proxy
-        proxy = JupyterHub.instance().proxy
+        app = JupyterHub.instance()
+        proxy = app.proxy
         for service_name, i_port in self.proxy_ports.items():
             ip, e_port = yield self.get_ip_and_port(i_port)
             path = self._proxy_path(service_name)
-            target = "http://{}:{}/".format(ip, e_port)
-            self.log.info("Adding proxy from {} to {}".format(path, target))
-            yield proxy.add_route(
-                path, target,
-                {"dockerspawner_proxy_for": self.user.name,
-                 "dockerspawner_container": self.container_id})
+            self.log.info("Adding proxy from {} to {}".format(path, service_name))
+            service = self._create_service(ip, e_port, path, service_name)
+            yield proxy.add_service(service)
 
         # jupyterhub 0.7 prefers returning ip, port:
         return (ip, port)
@@ -1194,9 +1208,17 @@ class DockerSpawner(Spawner):
             yield self.remove_object()
 
         # remove proxy ports
-        proxy = JupyterHub.instance().proxy
-        for service_name, i_port in self.proxy_ports.items():
-            yield proxy.delete_route(self._proxy_path(service_name))
+        app = JupyterHub.instance()
+        proxy = app.proxy
+        db = app.db
+        for service_name, _ in self.proxy_ports.items():
+            path = self._proxy_path(service_name)
+            name = service_name + ":" + self.user.name
+            service = app._service_map[name]
+            del app._service_map[name]
+            db.delete(service.orm)
+            db.commit()
+            yield proxy.delete_route(path)
 
         self.clear_state()
 
