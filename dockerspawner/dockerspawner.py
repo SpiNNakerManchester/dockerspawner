@@ -11,6 +11,8 @@ from tarfile import TarFile, TarInfo
 from textwrap import dedent
 from urllib.parse import urlparse
 import warnings
+from hashlib import md5
+import json
 
 import docker
 from docker.errors import APIError
@@ -921,11 +923,11 @@ class DockerSpawner(Spawner):
         return ['DNS:' + self.internal_hostname]
 
     @gen.coroutine
-    def create_object(self):
-        """Create the container/service object"""
+    def get_create_args(self, image):
+        """Get args to create the container/service object"""
 
         create_kwargs = dict(
-            image=self.image,
+            image=image,
             environment=self.get_env(),
             volumes=self.volume_mount_points,
             name=self.container_name,
@@ -964,9 +966,7 @@ class DockerSpawner(Spawner):
         host_config = self.client.create_host_config(**host_config)
         create_kwargs.setdefault("host_config", {}).update(host_config)
 
-        # create the container
-        obj = yield self.docker("create_container", **create_kwargs)
-        return obj
+        return create_kwargs
 
     @gen.coroutine
     def start_object(self):
@@ -1076,6 +1076,11 @@ class DockerSpawner(Spawner):
         image = self.image
         yield self.pull_image(image)
 
+        create_kwargs = yield self.get_create_args(image)
+        args_without_image = dict(create_kwargs)
+        del args_without_image["image"]
+        arg_hash = md5(json.dumps(args_without_image, sort_keys=True).encode("utf-8")).hexdigest()
+
         obj = yield self.get_object()
         if obj and self.remove:
             self.log.warning(
@@ -1087,9 +1092,30 @@ class DockerSpawner(Spawner):
             yield self.remove_object()
 
             obj = None
+        elif obj:
+            # Check if the container has the right args
+            labels = obj["Config"]["Labels"]
+            stored_arg_hash = labels.get("dockerspawner.arg_hash", "")
+
+            # If the arguments don't match, commit and restore the container
+            # with the new arguments
+            if stored_arg_hash != arg_hash:
+                self.log.info(
+                    "Container exists for %s but argument hash %s doesn't match expected %s",
+                    self.user.name, stored_arg_hash, arg_hash)
+                image_tag = obj[self.object_id_key] + "_temp"
+                yield self.stop_object()
+                yield self.docker("commit", obj[self.object_id_key], tag=image_tag)
+                yield self.remove_object()
+                create_kwargs["image"] = image_tag
+                obj = None
 
         if obj is None:
-            obj = yield self.create_object()
+            # create the container
+            labels = create_kwargs.get("labels", dict())
+            labels["dockerspawner.arg_hash"] = arg_hash
+            create_kwargs["labels"] = labels
+            obj = yield self.docker("create_container", **create_kwargs)
             self.object_id = obj[self.object_id_key]
             self.log.info(
                 "Created %s %s (id: %s) from image %s",
