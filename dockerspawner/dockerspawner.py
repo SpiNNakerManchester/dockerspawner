@@ -1103,11 +1103,11 @@ class DockerSpawner(Spawner):
                 self.log.info(
                     "Container exists for %s but argument hash %s doesn't match expected %s",
                     self.user.name, stored_arg_hash, arg_hash)
-                image_tag = obj[self.object_id_key] + "_temp"
+                image_repo = create_kwargs["name"] + "_image"
                 yield self.stop_object()
-                yield self.docker("commit", obj[self.object_id_key], tag=image_tag)
+                yield self.docker("commit", obj[self.object_id_key], repository=image_repo)
                 yield self.remove_object()
-                create_kwargs["image"] = image_tag
+                create_kwargs["image"] = image_repo
                 obj = None
 
         if obj is None:
