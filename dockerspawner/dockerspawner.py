@@ -846,6 +846,7 @@ class DockerSpawner(Spawner):
         )
 
         if container_state["Running"]:
+            yield self._update_proxy(fail=False)
             return None
 
         else:
@@ -1026,18 +1027,52 @@ class DockerSpawner(Spawner):
     def _proxy_path(self, service_name):
         return "/proxy/{}/{}/".format(self.user.name, service_name)
 
-    def _create_service(self, host, port, path, service_name):
+    @gen.coroutine
+    def _add_service_proxy(self, host, port, path, service_name):
         app = JupyterHub.instance()
+        proxy = app.proxy
         db = app.db
         name = service_name + ":" + self.user.name
-        orm_server = orm.Server(proto="http", ip=host, port=port, base_url=path, cookie_name="")
-        server = Server.from_orm(orm_server)
-        orm_service = orm.Service(name=name, server=orm_server)
-        db.add(orm_service)
-        db.commit()
-        service = Service(app=app, db=db, orm=orm_service, domain='', host=host, hub=app.hub)
-        app._service_map[name] = service
-        return service
+        if name not in app._service_map:
+            orm_service = orm.Service.find(db, name=name)
+            if orm_service is None:
+                orm_server = orm.Server(proto="http", ip=host, port=port, base_url=path, cookie_name="")
+                server = Server.from_orm(orm_server)
+                orm_service = orm.Service(name=name, server=orm_server)
+                db.add(orm_service)
+                db.commit()
+            service = Service(app=app, db=db, name=name, orm=orm_service, domain='', host=host, hub=app.hub)
+            app._service_map[name] = service
+            yield proxy.add_service(service)
+
+    @gen.coroutine
+    def _update_proxy(self, fail=True):
+        # map additional ports to the proxy
+        for service_name, i_port in self.proxy_ports.items():
+            ip, e_port = yield self.get_ip_and_port(i_port, fail)
+            if e_port is not None:
+                path = self._proxy_path(service_name)
+                yield self._add_service_proxy(ip, e_port, path, service_name)
+
+    def _get_arg_hash(self, create_kwargs):
+        """Get a hash for the arguments, based on things that shouldn't change
+        """
+        # Make a copy to avoid changing the real thing
+        compare_args = dict(create_kwargs)
+
+        # Remove the image as we can't change by restarting
+        del compare_args["image"]
+
+        # Remove the API tokens as these change on each run
+        env = dict(compare_args["environment"])
+        del env["JPY_API_TOKEN"]
+        del env["JUPYTERHUB_API_TOKEN"]
+        compare_args["environment"] = env
+
+        # Get a hash based on the sorted JSON
+        arg_json = json.dumps(compare_args, sort_keys=True)
+        self.log.info("JSON Args = {}".format(arg_json))
+        return md5(arg_json.encode("utf-8")).hexdigest()
 
     @gen.coroutine
     def start(self, image=None, extra_create_kwargs=None, extra_host_config=None):
@@ -1077,9 +1112,7 @@ class DockerSpawner(Spawner):
         yield self.pull_image(image)
 
         create_kwargs = yield self.get_create_args(image)
-        args_without_image = dict(create_kwargs)
-        del args_without_image["image"]
-        arg_hash = md5(json.dumps(args_without_image, sort_keys=True).encode("utf-8")).hexdigest()
+        arg_hash = self._get_arg_hash(create_kwargs)
 
         obj = yield self.get_object()
         if obj and self.remove:
@@ -1092,7 +1125,7 @@ class DockerSpawner(Spawner):
             yield self.remove_object()
 
             obj = None
-        elif obj:
+        elif obj and obj["State"] != "Running":
             # Check if the container has the right args
             labels = obj["Config"]["Labels"]
             stored_arg_hash = labels.get("dockerspawner.arg_hash", "")
@@ -1160,15 +1193,7 @@ class DockerSpawner(Spawner):
             self.user.server.ip = ip
             self.user.server.port = port
 
-        # map additional ports to the proxy
-        app = JupyterHub.instance()
-        proxy = app.proxy
-        for service_name, i_port in self.proxy_ports.items():
-            ip, e_port = yield self.get_ip_and_port(i_port)
-            path = self._proxy_path(service_name)
-            self.log.info("Adding proxy from {} to {}".format(path, service_name))
-            service = self._create_service(ip, e_port, path, service_name)
-            yield proxy.add_service(service)
+        yield self._update_proxy()
 
         # jupyterhub 0.7 prefers returning ip, port:
         return (ip, port)
@@ -1182,7 +1207,7 @@ class DockerSpawner(Spawner):
         return self.container_name
 
     @gen.coroutine
-    def get_ip_and_port(self, internal_port=None):
+    def get_ip_and_port(self, internal_port=None, fail=True):
         """Queries Docker daemon for container's IP and a given internal port,
         or the container port if internal_port is None.
 
@@ -1221,7 +1246,9 @@ class DockerSpawner(Spawner):
         else:
             resp = yield self.docker("port", self.container_id, internal_port)
             if resp is None:
-                raise RuntimeError("Failed to get port info on port %d for %s" % (internal_port, self.container_id))
+                if fail:
+                    raise RuntimeError("Failed to get port info on port %d for %s" % (internal_port, self.container_id))
+                return None, None
 
             ip = resp[0]["HostIp"]
             port = int(resp[0]["HostPort"])
