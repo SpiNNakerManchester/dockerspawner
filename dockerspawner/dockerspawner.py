@@ -645,13 +645,21 @@ class DockerSpawner(Spawner):
         ),
     )
 
-    post_start_cmd = UnicodeOrFalse(
-        False,
+    post_start_cmd = List(
+        Unicode,
+        [],
         config=True,
         help=""" If specified, the command will be executed inside the container
         after starting.
         Similar to using 'docker exec'
         """
+    )
+
+    post_start_files = Dict(
+        {},
+        config=True,
+        help="A dictionary of source (host) and target (container) files to"
+             " be copied to the container after starting it"
     )
 
     @gen.coroutine
@@ -667,12 +675,32 @@ class DockerSpawner(Spawner):
 
         exec_kwargs = {
             'cmd': self.post_start_cmd,
-            'container': container_id
+            'container': container_id,
+            'user': "0"
         }
         
+        self.log.info("Executing command {} in container {}".format(self.post_start_cmd, container_id))
         exec_id = yield self.docker("exec_create", **exec_kwargs)
 
-        return self.docker("exec_start", exec_id=exec_id)
+        response = yield self.docker("exec_start", exec_id=exec_id)
+        self.log.info("Exec result: {}".format(response))
+
+    @gen.coroutine
+    def post_start_copy(self):
+        """
+        Copy files to a container after starting it
+        """
+        container = yield self.get_object()
+        container_id = container[self.object_id_key]
+
+        temptar_buf = BytesIO()
+        temptar = TarFile(fileobj=temptar_buf, mode="w")
+        for src, target in self.post_start_files.items():
+            temptar.add(src, arcname=target)
+        temptar.close()
+        temptar_buf.seek(0)
+        yield self.docker("put_archive", container_id, "/", temptar_buf)
+        temptar_buf.close()
 
     @property
     def tls_client(self):
@@ -1136,10 +1164,19 @@ class DockerSpawner(Spawner):
                 self.log.info(
                     "Container exists for %s but argument hash %s doesn't match expected %s",
                     self.user.name, stored_arg_hash, arg_hash)
-                image_repo = create_kwargs["name"] + "_image"
+                image_repo = create_kwargs["name"].lower() + "_image"
+                config_image = obj["Config"]["Image"]
+                image_sha = obj["Image"]
                 yield self.stop_object()
                 yield self.docker("commit", obj[self.object_id_key], repository=image_repo)
                 yield self.remove_object()
+                # If we already had committed an image, delete the old one if possible
+                if config_image == image_repo:
+                    try:
+                        self.log.info("Removing old commit %s", image_sha)
+                        self.docker("remove_image", image_sha)
+                    except Exception as e:
+                        self.log.warn("Could not remove image: %s", e.message)
                 create_kwargs["image"] = image_repo
                 obj = None
 
@@ -1155,7 +1192,7 @@ class DockerSpawner(Spawner):
                 self.object_type,
                 self.object_name,
                 self.object_id[:7],
-                self.image,
+                create_kwargs["image"],
             )
 
         else:
@@ -1183,6 +1220,9 @@ class DockerSpawner(Spawner):
 
         # start the container
         yield self.start_object()
+
+        if self.post_start_files:
+            yield self.post_start_copy()
 
         if self.post_start_cmd:
             yield self.post_start_exec()
