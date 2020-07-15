@@ -2,6 +2,8 @@
 A Spawner for JupyterHub that runs each user's server in a separate docker container
 """
 
+from async_generator import async_generator, yield_
+
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 import os
@@ -11,6 +13,8 @@ from tarfile import TarFile, TarInfo
 from textwrap import dedent
 from urllib.parse import urlparse
 import warnings
+from hashlib import md5
+import json
 
 import docker
 from docker.errors import APIError
@@ -874,11 +878,11 @@ class DockerSpawner(Spawner):
         return ['DNS:' + self.internal_hostname]
 
     @gen.coroutine
-    def create_object(self):
-        """Create the container/service object"""
+    def get_create_args(self, image):
+        """Get args to create the container/service object"""
 
         create_kwargs = dict(
-            image=self.image,
+            image=image,
             environment=self.get_env(),
             volumes=self.volume_mount_points,
             name=self.container_name,
@@ -909,9 +913,7 @@ class DockerSpawner(Spawner):
         host_config = self.client.create_host_config(**host_config)
         create_kwargs.setdefault("host_config", {}).update(host_config)
 
-        # create the container
-        obj = yield self.docker("create_container", **create_kwargs)
-        return obj
+        return create_kwargs
 
     @gen.coroutine
     def start_object(self):
@@ -968,6 +970,38 @@ class DockerSpawner(Spawner):
                 self.log.info("pulling image %s", image)
                 yield self.docker('pull', repo, tag)
 
+    def _get_arg_hash(self, create_kwargs):
+        """Get a hash for the arguments, based on things that shouldn't change
+        """
+        # Make a copy to avoid changing the real thing
+        compare_args = dict(create_kwargs)
+
+        # Remove the image as we can't change by restarting
+        del compare_args["image"]
+
+        # Remove the API tokens as these change on each run
+        env = dict(compare_args["environment"])
+        del env["JPY_API_TOKEN"]
+        del env["JUPYTERHUB_API_TOKEN"]
+        compare_args["environment"] = env
+
+        # Get a hash based on the sorted JSON
+        arg_json = json.dumps(compare_args, sort_keys=True)
+        self.log.info("JSON Args = {}".format(arg_json))
+        return md5(arg_json.encode("utf-8")).hexdigest()
+
+    @async_generator
+    async def progress(self):
+        if not hasattr(self, "_progress"):
+            await yield_({
+                "progress": 50,
+                "message": "Spawning server..."
+            })
+        await yield_({
+            "progress": self._progress,
+            "message": self._progress_message
+        })
+
     @gen.coroutine
     def start(self, image=None, extra_create_kwargs=None, extra_host_config=None):
         """Start the single-user server in a docker container.
@@ -979,6 +1013,8 @@ class DockerSpawner(Spawner):
         the container is removed first. Otherwise, the existing containers
         will be restarted.
         """
+        self._progress = 0
+        self._progress_message = "Spawning server..."
 
         if image:
             self.log.warning("Specifying image via .start args is deprecated")
@@ -1005,6 +1041,9 @@ class DockerSpawner(Spawner):
         image = self.image
         yield self.pull_image(image)
 
+        create_kwargs = yield self.get_create_args(image)
+        arg_hash = self._get_arg_hash(create_kwargs)
+
         obj = yield self.get_object()
         if obj and self.remove:
             self.log.warning(
@@ -1016,16 +1055,62 @@ class DockerSpawner(Spawner):
             yield self.remove_object()
 
             obj = None
+        elif obj and obj["State"] != "Running":
+            # Check if the container has the right args
+            labels = obj["Config"]["Labels"]
+            stored_arg_hash = labels.get("dockerspawner.arg_hash", "")
+
+            # If the arguments don't match, commit and restore the container
+            # with the new arguments
+            if stored_arg_hash != arg_hash:
+                self._progress = 25
+                self._progress_message = "Server needs updating... this might take some time..."
+                self.log.info(
+                    "Container exists for %s but argument hash %s doesn't match expected %s",
+                    self.user.name, stored_arg_hash, arg_hash)
+                yield self.stop_object()
+                image_repo = create_kwargs["name"].lower() + "_image"
+                # Find an existing image
+                existing_images = yield self.docker("images", name=image_repo, quiet=True)
+                existing_image_arg_hash = ""
+                if existing_images:
+                    image_obj = yield self.docker("inspect_image", existing_images[0])
+                    existing_image_arg_hash = image_obj["Config"]["Labels"].get("dockerspawner.arg_hash", "")
+                    self.log.info("Existing image %s found with hash %s", image_repo, existing_image_arg_hash)
+                if existing_image_arg_hash != arg_hash:
+                    self.log.info("Commiting %s for %s", image_repo, self.user.name)
+                    yield self.docker("commit", obj[self.object_id_key], repository=image_repo, conf={"Labels": {"dockerspawner.arg_hash": arg_hash}})
+                else:
+                    self.log.info("Existing image %s matches hash", image_repo)
+                self.log.info("Removing existing container for %s", self.user.name)
+                yield self.remove_object()
+
+                # If we already had committed an image, delete the old one if possible
+                if existing_images and existing_image_arg_hash != arg_hash:
+                    try:
+                        self.log.info("Removing old commit %s", existing_images[0])
+                        self.docker("remove_image", existing_images[0])
+                    except Exception as e:
+                        self.log.warn("Could not remove image: %s", e.message)
+                create_kwargs["image"] = image_repo
+                obj = None
+
+        self._progress = 50
+        self._progress_message = "Starting server..."
 
         if obj is None:
-            obj = yield self.create_object()
+            # create the container
+            labels = create_kwargs.get("labels", dict())
+            labels["dockerspawner.arg_hash"] = arg_hash
+            create_kwargs["labels"] = labels
+            obj = yield self.docker("create_container", **create_kwargs)
             self.object_id = obj[self.object_id_key]
             self.log.info(
                 "Created %s %s (id: %s) from image %s",
                 self.object_type,
                 self.object_name,
                 self.object_id[:7],
-                self.image,
+                create_kwargs["image"],
             )
 
         else:
@@ -1054,6 +1139,9 @@ class DockerSpawner(Spawner):
         # start the container
         yield self.start_object()
 
+        self._progress = 75
+        self._progress_message = "Preparing server for use..."
+
         if self.post_start_cmd:
             yield self.post_start_exec()
 
@@ -1062,6 +1150,10 @@ class DockerSpawner(Spawner):
             # store on user for pre-jupyterhub-0.7:
             self.user.server.ip = ip
             self.user.server.port = port
+
+        self._progress = 100
+        self._progress_message = "Server ready"
+
         # jupyterhub 0.7 prefers returning ip, port:
         return (ip, port)
 
