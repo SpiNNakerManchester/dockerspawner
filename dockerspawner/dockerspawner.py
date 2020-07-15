@@ -624,6 +624,13 @@ class DockerSpawner(Spawner):
         """
     )
 
+    post_start_files = Dict(
+        {},
+        config=True,
+        help="A dictionary of source (host) and target (container) files to"
+             " be copied to the container after starting it"
+    )
+
     @gen.coroutine
     def post_start_exec(self):
         """
@@ -643,6 +650,23 @@ class DockerSpawner(Spawner):
         exec_id = yield self.docker("exec_create", **exec_kwargs)
 
         return self.docker("exec_start", exec_id=exec_id)
+
+    @gen.coroutine
+    def post_start_copy(self):
+        """
+        Copy files to a container after starting it
+        """
+        container = yield self.get_object()
+        container_id = container[self.object_id_key]
+
+        temptar_buf = BytesIO()
+        temptar = TarFile(fileobj=temptar_buf, mode="w")
+        for src, target in self.post_start_files.items():
+            temptar.add(src, arcname=target)
+        temptar.close()
+        temptar_buf.seek(0)
+        yield self.docker("put_archive", container_id, "/", temptar_buf)
+        temptar_buf.close()
 
     @property
     def tls_client(self):
@@ -1053,6 +1077,9 @@ class DockerSpawner(Spawner):
 
         # start the container
         yield self.start_object()
+        
+        if self.post_start_files:
+            yield self.post_start_copy()
 
         if self.post_start_cmd:
             yield self.post_start_exec()
