@@ -1054,6 +1054,36 @@ class DockerSpawner(Spawner):
                 self.log.info("pulling image %s", image)
                 yield self.docker('pull', repo, tag)
 
+    def _proxy_path(self, service_name):
+        return "/proxy/{}/{}/".format(self.user.name, service_name)
+
+    @gen.coroutine
+    def _add_service_proxy(self, host, port, path, service_name):
+        app = JupyterHub.instance()
+        proxy = app.proxy
+        db = app.db
+        name = service_name + ":" + self.user.name
+        if name not in app._service_map:
+            orm_service = orm.Service.find(db, name=name)
+            if orm_service is None:
+                orm_server = orm.Server(proto="http", ip=host, port=port, base_url=path, cookie_name="")
+                server = Server.from_orm(orm_server)
+                orm_service = orm.Service(name=name, server=orm_server)
+                db.add(orm_service)
+                db.commit()
+            service = Service(app=app, db=db, name=name, orm=orm_service, domain='', host=host, hub=app.hub)
+            app._service_map[name] = service
+            yield proxy.add_service(service)
+
+    @gen.coroutine
+    def _update_proxy(self, fail=True):
+        # map additional ports to the proxy
+        for service_name, i_port in self.proxy_ports.items():
+            ip, e_port = yield self.get_ip_and_port(i_port, fail)
+            if e_port is not None:
+                path = self._proxy_path(service_name)
+                yield self._add_service_proxy(ip, e_port, path, service_name)
+
     def _get_arg_hash(self, create_kwargs):
         """Get a hash for the arguments, based on things that shouldn't change
         """
@@ -1085,36 +1115,6 @@ class DockerSpawner(Spawner):
             "progress": self._progress,
             "message": self._progress_message
         })
-        
-    def _proxy_path(self, service_name):
-        return "/proxy/{}/{}/".format(self.user.name, service_name)
-
-    @gen.coroutine
-    def _add_service_proxy(self, host, port, path, service_name):
-        app = JupyterHub.instance()
-        proxy = app.proxy
-        db = app.db
-        name = service_name + ":" + self.user.name
-        if name not in app._service_map:
-            orm_service = orm.Service.find(db, name=name)
-            if orm_service is None:
-                orm_server = orm.Server(proto="http", ip=host, port=port, base_url=path, cookie_name="")
-                server = Server.from_orm(orm_server)
-                orm_service = orm.Service(name=name, server=orm_server)
-                db.add(orm_service)
-                db.commit()
-            service = Service(app=app, db=db, name=name, orm=orm_service, domain='', host=host, hub=app.hub)
-            app._service_map[name] = service
-            yield proxy.add_service(service)
-
-    @gen.coroutine
-    def _update_proxy(self, fail=True):
-        # map additional ports to the proxy
-        for service_name, i_port in self.proxy_ports.items():
-            ip, e_port = yield self.get_ip_and_port(i_port, fail)
-            if e_port is not None:
-                path = self._proxy_path(service_name)
-                yield self._add_service_proxy(ip, e_port, path, service_name)
 
     @gen.coroutine
     def start(self, image=None, extra_create_kwargs=None, extra_host_config=None):
@@ -1252,12 +1252,12 @@ class DockerSpawner(Spawner):
 
         # start the container
         yield self.start_object()
-        
-        if self.post_start_files:
-            yield self.post_start_copy()
 
         self._progress = 75
         self._progress_message = "Preparing server for use..."
+
+        if self.post_start_files:
+            yield self.post_start_copy()
 
         if self.post_start_cmd:
             yield self.post_start_exec()
@@ -1267,7 +1267,7 @@ class DockerSpawner(Spawner):
             # store on user for pre-jupyterhub-0.7:
             self.user.server.ip = ip
             self.user.server.port = port
-        
+
         yield self._update_proxy()
 
         self._progress = 100
