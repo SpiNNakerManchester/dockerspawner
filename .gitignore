@@ -70,3 +70,7 @@ src
 .pytest_cache
 jupyterhub.sqlite
 jupyterhub_cookie_secret
+
+.project
+.pydevproject
+
