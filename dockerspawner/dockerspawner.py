@@ -647,8 +647,9 @@ class DockerSpawner(Spawner):
         ),
     )
 
-    post_start_cmd = UnicodeOrFalse(
-        False,
+    post_start_cmd = List(
+        Unicode,
+        [],
         config=True,
         help=""" If specified, the command will be executed inside the container
         after starting.
@@ -669,12 +670,15 @@ class DockerSpawner(Spawner):
 
         exec_kwargs = {
             'cmd': self.post_start_cmd,
-            'container': container_id
+            'container': container_id,
+            'user': "0"
         }
         
+        self.log.info("Executing command {} in container {}".format(self.post_start_cmd, container_id))
         exec_id = yield self.docker("exec_create", **exec_kwargs)
 
-        return self.docker("exec_start", exec_id=exec_id)
+        response = yield self.docker("exec_start", exec_id=exec_id)
+        self.log.info("Exec result: {}".format(response))
 
     @property
     def tls_client(self):
